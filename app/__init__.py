@@ -1,0 +1,1 @@
+"""Postik Backend Application Package."""
