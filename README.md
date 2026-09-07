@@ -60,13 +60,17 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 ```
-Edit `.env` to match your local PostgreSQL credentials:
+Edit `.env` to configure your PostgreSQL and Redis credentials:
 ```env
 POSTGRES_SERVER=localhost
 POSTGRES_PORT=5432
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
 POSTGRES_DB=postik_db
+
+REDIS_URL=redis://localhost:6379/0
+JWT_SECRET_KEY=your-secure-jwt-secret-key
+SMS_MOCK_MODE=True
 ```
 
 ### 4. Database Migrations (Alembic)
@@ -85,10 +89,11 @@ alembic upgrade head
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-## API Documentation
+## API Documentation & Health
 
 Once the server is running, visit:
 - **Interactive Swagger UI:** [http://localhost:8000/docs](http://localhost:8000/docs)
 - **ReDoc UI:** [http://localhost:8000/redoc](http://localhost:8000/redoc)
-- **Health Check Endpoint:** [http://localhost:8000/api/v1/health](http://localhost:8000/api/v1/health)
+- **Health Check Endpoint:** [http://localhost:8000/api/v1/health](http://localhost:8000/api/v1/health) (or `http://localhost:8000/health`)
+
 
