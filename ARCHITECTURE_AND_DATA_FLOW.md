@@ -57,7 +57,7 @@ postik-backend/
 │   │   ├── deps.py                  # Reusable Dependency Injections (SessionDep, RedisDep)
 │   │   └── v1/                      # Version 1 of our API
 │   │       ├── router.py            # Master router combining all v1 feature endpoints
-│   │       └── endpoints/           # Individual endpoint controllers
+│   │       └── endpoints/           # 
 │   │           └── health.py        # GET /api/v1/health (DB + Redis liveness checks)
 │   │
 │   ├── core/                        # System Configurations & Singletons
