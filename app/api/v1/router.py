@@ -12,12 +12,12 @@ Beginner Concepts:
    uninterrupted while newer versions use `/v2`.
 
 2. **Router Aggregation**:
-   Each sub-module (like `health.py` or upcoming `auth.py`) has its own `APIRouter`.
+   Each sub-module (like `health.py` or `auth.py`) has its own `APIRouter`.
    This master router includes them all and organizes them with OpenAPI tags for Swagger UI.
 """
 
 from fastapi import APIRouter
-from app.api.v1.endpoints import health
+from app.api.v1.endpoints import auth, health
 
 # Create the top-level v1 router
 api_router = APIRouter()
@@ -25,5 +25,5 @@ api_router = APIRouter()
 # Include health endpoints under the "Health" OpenAPI tag
 api_router.include_router(health.router, tags=["Health"])
 
-# Future Story routers will be mounted here:
-# api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
+# Include authentication endpoints under the "Authentication" OpenAPI tag
+api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
