@@ -4,6 +4,7 @@ Authentication API Endpoints
 This module implements the routes for phone-first authentication:
 - `POST /api/v1/auth/otp/send`: Request a one-time verification SMS code.
 - `POST /api/v1/auth/otp/verify`: Verify submitted OTP and issue tokens / registration flow.
+- `POST /api/v1/auth/register`: Onboard new customer by validating registration token and creating user profile.
 
 Beginner Concepts:
 ------------------
@@ -13,29 +14,40 @@ Beginner Concepts:
    - If the phone exists in the `users` table -> Log in directly by issuing an Access + Refresh token pair.
    - If the phone is new -> Issue a scoped `registration_token` granting permission to complete profile registration.
 
-2. **Session Persistence**:
-   For existing users, we create a record in `refresh_sessions` storing `SHA-256(refresh_token)`
-   so the session can be tracked, rotated, or revoked on the server.
+2. **One-Time Token Enforcement (JTI Replay Guard)**:
+   When registering, the client passes `Authorization: Bearer <registration_token>`.
+   We atomically mark the token's unique `jti` as consumed in Redis (`SET NX`).
+   If the token is re-submitted, Redis rejects it, preventing duplicate signups or replay attacks.
+
+3. **Database Flush vs Commit**:
+   `await db.flush()` writes the new user row to PostgreSQL inside the current transaction, 
+   assigning IDs and validating database constraints, without closing the transaction yet.
+   This allows us to link the initial `refresh_sessions` record to `new_user.id` in the exact same atomic transaction!
 """
 
 import datetime
 import logging
+import uuid
 from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from sqlalchemy import select
 
-from app.api.deps import RedisDep, SessionDep
+from app.api.deps import RedisDep, RegistrationClaimsDep, SessionDep
 from app.core.config import settings
 from app.core.security import (
     create_access_token,
     create_refresh_token,
     create_registration_token,
+    mark_jti_consumed,
 )
 from app.models.session import RefreshSession
 from app.models.user import User
 from app.schemas.auth import (
+    AuthResponse,
+    RegisterRequest,
     SendOTPRequest,
     SendOTPResponse,
+    UserResponse,
     VerifyOTPRequest,
     VerifyOTPResponse,
 )
@@ -251,4 +263,126 @@ async def verify_otp(
     return VerifyOTPResponse(
         is_new_user=True,
         registration_token=registration_token,
+    )
+
+
+# ==============================================================================
+# 3. POST /api/v1/auth/register
+# ==============================================================================
+
+@router.post(
+    "/register",
+    response_model=AuthResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register New Customer Profile",
+    description="Onboards a new customer using a verified registration token from OTP verification.",
+    responses={
+        201: {
+            "description": "User successfully registered.",
+            "model": AuthResponse,
+        },
+        401: {
+            "description": "Invalid, expired, or already consumed registration token.",
+        },
+        409: {
+            "description": "Phone number or email is already registered.",
+        },
+    },
+)
+async def register_user(
+    payload: RegisterRequest,
+    claims: RegistrationClaimsDep,
+    db: SessionDep,
+    redis: RedisDep,
+    x_device_id: Optional[str] = Header(
+        default=None,
+        description="Optional client device identifier (e.g. mobile device model)",
+    ),
+) -> AuthResponse:
+    """
+    Endpoint handler for POST /api/v1/auth/register.
+    
+    Security Workflow:
+    1. Validate Bearer token signature and scope == 'register'.
+    2. Atomically mark JTI as consumed in Redis using SET NX (blocks token replay).
+    3. Defensively check phone uniqueness in PostgreSQL.
+    4. Validate email uniqueness if email provided.
+    5. Insert customer record in 'users' and initial session in 'refresh_sessions'.
+    6. Return access_token, refresh_token, and user profile.
+    """
+    phone = claims["phone"]
+    jti = claims["jti"]
+    remaining_ttl = claims["remaining_ttl"]
+
+    # 1. Atomic JTI consumption check in Redis (blocks reuse of this registration token)
+    consumed = await mark_jti_consumed(redis, jti, remaining_ttl)
+    if not consumed:
+        logger.warning(f"Registration replay attempt detected for JTI {jti}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "TOKEN_ALREADY_CONSUMED",
+                "message": "This registration token has already been used. Please verify your phone again.",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 2. Defensive check: Verify phone is not already taken
+    phone_query = await db.execute(select(User).where(User.phone == phone))
+    if phone_query.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "PHONE_ALREADY_EXISTS",
+                "message": "An account with this phone number already exists. Please log in directly.",
+            },
+        )
+
+    # 3. Check email uniqueness if email is provided
+    if payload.email:
+        email_query = await db.execute(select(User).where(User.email == payload.email))
+        if email_query.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "EMAIL_ALREADY_EXISTS",
+                    "message": "This email address is already associated with another account.",
+                },
+            )
+
+    # 4. Insert new User into PostgreSQL
+    new_user = User(
+        id=uuid.uuid4(),
+        phone=phone,
+        name=payload.name,
+        email=payload.email,
+        is_active=True,
+    )
+    db.add(new_user)
+    await db.flush()  # Flushes new_user.id into active transaction
+
+    # 5. Issue Access & Refresh tokens
+    access_token = create_access_token(user_id=str(new_user.id))
+    raw_refresh_token, refresh_token_hash = create_refresh_token()
+
+    expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        days=settings.REFRESH_TOKEN_EXPIRE_DAYS
+    )
+
+    # 6. Record initial refresh session
+    refresh_session = RefreshSession(
+        user_id=new_user.id,
+        token_hash=refresh_token_hash,
+        device_id=x_device_id,
+        expires_at=expires_at,
+    )
+    db.add(refresh_session)
+
+    logger.info(f"New user registered: {new_user.id} ({phone})")
+
+    return AuthResponse(
+        access_token=access_token,
+        refresh_token=raw_refresh_token,
+        token_type="bearer",
+        user=UserResponse.model_validate(new_user),
     )
