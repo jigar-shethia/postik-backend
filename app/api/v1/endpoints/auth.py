@@ -471,6 +471,7 @@ async def refresh_tokens(
             )
             .values(revoked_at=now)
         )
+        await db.commit()  # Explicitly commit revocation before raising exception
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
@@ -482,7 +483,12 @@ async def refresh_tokens(
 
     # 4. Check if session has expired
     now = datetime.datetime.now(datetime.timezone.utc)
-    if session.expires_at < now:
+    session_expiry = (
+        session.expires_at.replace(tzinfo=datetime.timezone.utc)
+        if session.expires_at.tzinfo is None
+        else session.expires_at
+    )
+    if session_expiry < now:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={

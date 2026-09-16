@@ -31,8 +31,7 @@ Beginner Concepts:
 import datetime
 import uuid
 from typing import TYPE_CHECKING, Optional
-from sqlalchemy import DateTime, ForeignKey, String, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import DateTime, ForeignKey, String, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -49,14 +48,14 @@ class RefreshSession(Base):
 
     # UUID Primary Key
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
     )
 
     # Foreign Key linking to the User who owns this session
     user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         index=True,
         nullable=False,
@@ -89,7 +88,7 @@ class RefreshSession(Base):
 
     # Pointer to the new session ID that replaced this one during token rotation
     replaced_by: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         ForeignKey("refresh_sessions.id", ondelete="SET NULL"),
         nullable=True,
     )

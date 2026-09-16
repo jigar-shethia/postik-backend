@@ -26,8 +26,7 @@ Beginner Concepts:
 
 import uuid
 from typing import TYPE_CHECKING, List, Optional
-from sqlalchemy import Boolean, String
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Boolean, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
@@ -54,7 +53,7 @@ class User(Base, TimestampMixin):
 
     # UUID Primary Key
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
     )
