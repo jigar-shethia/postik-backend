@@ -1,10 +1,12 @@
 """
 Authentication API Endpoints
 ============================
-This module implements the routes for phone-first authentication:
+This module implements the complete suite of phone-first authentication routes:
 - `POST /api/v1/auth/otp/send`: Request a one-time verification SMS code.
 - `POST /api/v1/auth/otp/verify`: Verify submitted OTP and issue tokens / registration flow.
 - `POST /api/v1/auth/register`: Onboard new customer by validating registration token and creating user profile.
+- `POST /api/v1/auth/refresh`: Rotate refresh tokens with automatic token reuse / theft detection.
+- `GET /api/v1/auth/me`: Retrieve the authenticated user's profile.
 
 Beginner Concepts:
 ------------------
@@ -19,10 +21,10 @@ Beginner Concepts:
    We atomically mark the token's unique `jti` as consumed in Redis (`SET NX`).
    If the token is re-submitted, Redis rejects it, preventing duplicate signups or replay attacks.
 
-3. **Database Flush vs Commit**:
-   `await db.flush()` writes the new user row to PostgreSQL inside the current transaction, 
-   assigning IDs and validating database constraints, without closing the transaction yet.
-   This allows us to link the initial `refresh_sessions` record to `new_user.id` in the exact same atomic transaction!
+3. **Token Rotation & Theft Detection**:
+   Every time a refresh token is used, it is revoked and replaced with a new one (`replaced_by`).
+   If an old, already-revoked refresh token is ever submitted, the server detects token theft
+   and immediately revokes ALL active sessions for that user.
 """
 
 import datetime
@@ -30,14 +32,15 @@ import logging
 import uuid
 from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from app.api.deps import RedisDep, RegistrationClaimsDep, SessionDep
+from app.api.deps import CurrentUserDep, RedisDep, RegistrationClaimsDep, SessionDep
 from app.core.config import settings
 from app.core.security import (
     create_access_token,
     create_refresh_token,
     create_registration_token,
+    hash_token,
     mark_jti_consumed,
 )
 from app.models.session import RefreshSession
@@ -47,6 +50,8 @@ from app.schemas.auth import (
     RegisterRequest,
     SendOTPRequest,
     SendOTPResponse,
+    TokenRefreshRequest,
+    TokenRefreshResponse,
     UserResponse,
     VerifyOTPRequest,
     VerifyOTPResponse,
@@ -386,3 +391,174 @@ async def register_user(
         token_type="bearer",
         user=UserResponse.model_validate(new_user),
     )
+
+
+# ==============================================================================
+# 4. POST /api/v1/auth/refresh
+# ==============================================================================
+
+@router.post(
+    "/refresh",
+    response_model=TokenRefreshResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Rotate Refresh Token",
+    description="Rotates an existing refresh token, detects token reuse/theft, and returns new access & refresh tokens.",
+    responses={
+        200: {
+            "description": "Tokens successfully rotated.",
+            "model": TokenRefreshResponse,
+        },
+        401: {
+            "description": "Invalid, expired, or already-revoked refresh token.",
+        },
+        403: {
+            "description": "Account is deactivated.",
+        },
+    },
+)
+async def refresh_tokens(
+    payload: TokenRefreshRequest,
+    db: SessionDep,
+    x_device_id: Optional[str] = Header(
+        default=None,
+        description="Optional client device identifier",
+    ),
+) -> TokenRefreshResponse:
+    """
+    Endpoint handler for POST /api/v1/auth/refresh.
+    
+    Security Workflow:
+    1. Compute SHA-256 hash of submitted refresh token.
+    2. Look up session in 'refresh_sessions'.
+    3. If token is ALREADY revoked (revoked_at IS NOT NULL) -> Token theft detected!
+       Immediately revoke ALL active sessions for that user.
+    4. Verify session expiration and user active status.
+    5. Generate new access & refresh tokens.
+    6. Mark old session revoked and link replaced_by to the new session.
+    """
+    # 1. Compute SHA-256 hash of submitted refresh token
+    token_hash = hash_token(payload.refresh_token)
+
+    # 2. Look up session in PostgreSQL
+    result = await db.execute(
+        select(RefreshSession).where(RefreshSession.token_hash == token_hash)
+    )
+    session = result.scalar_one_or_none()
+
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "INVALID_REFRESH_TOKEN",
+                "message": "Refresh token is invalid or does not exist.",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 3. 🚨 Token Theft & Reuse Detection
+    # If the token exists but was ALREADY revoked/rotated, an attacker is attempting to reuse an old token!
+    if session.revoked_at is not None:
+        logger.critical(
+            f"SECURITY ALERT: Re-use of revoked refresh token detected for user {session.user_id}! Revoking all active sessions."
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        # Invalidate all active sessions for this user immediately
+        await db.execute(
+            update(RefreshSession)
+            .where(
+                RefreshSession.user_id == session.user_id,
+                RefreshSession.revoked_at.is_(None),
+            )
+            .values(revoked_at=now)
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "TOKEN_THEFT_DETECTED",
+                "message": "Invalid refresh session. For your security, all active sessions have been invalidated.",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 4. Check if session has expired
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if session.expires_at < now:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "REFRESH_TOKEN_EXPIRED",
+                "message": "Refresh token has expired. Please log in again.",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 5. Verify user is active
+    user_result = await db.execute(select(User).where(User.id == session.user_id))
+    user = user_result.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "ACCOUNT_DEACTIVATED",
+                "message": "User account is inactive or deleted.",
+            },
+        )
+
+    # 6. Generate new token pair
+    new_access_token = create_access_token(user_id=str(session.user_id))
+    raw_new_refresh, new_refresh_hash = create_refresh_token()
+
+    new_expires_at = now + datetime.timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+
+    # 7. Create new session row
+    new_session = RefreshSession(
+        id=uuid.uuid4(),
+        user_id=session.user_id,
+        token_hash=new_refresh_hash,
+        device_id=x_device_id or session.device_id,
+        expires_at=new_expires_at,
+    )
+    db.add(new_session)
+    await db.flush()
+
+    # 8. Mark old session as revoked and link replaced_by
+    session.revoked_at = now
+    session.replaced_by = new_session.id
+
+    logger.info(f"Refreshed session for user {session.user_id}. Old session rotated.")
+
+    return TokenRefreshResponse(
+        access_token=new_access_token,
+        refresh_token=raw_new_refresh,
+        token_type="bearer",
+    )
+
+
+# ==============================================================================
+# 5. GET /api/v1/auth/me
+# ==============================================================================
+
+@router.get(
+    "/me",
+    response_model=UserResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get Current User Profile",
+    description="Fetches the authenticated user's profile using their Bearer access token.",
+    responses={
+        200: {
+            "description": "User profile retrieved successfully.",
+            "model": UserResponse,
+        },
+        401: {
+            "description": "Missing, invalid, or expired access token.",
+        },
+    },
+)
+async def get_me(
+    current_user: CurrentUserDep,
+) -> UserResponse:
+    """
+    Endpoint handler for GET /api/v1/auth/me.
+    Returns the authenticated user's profile information.
+    """
+    return UserResponse.model_validate(current_user)
