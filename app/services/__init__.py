@@ -1,7 +1,7 @@
 """
 Business Logic Services Package
 ===============================
-This package contains services implementing core domain and security logic.
+This package contains services implementing core domain, security, and dispatch logic.
 """
 
 from app.services.otp_service import (
@@ -11,6 +11,13 @@ from app.services.otp_service import (
     save_otp_hash,
     verify_otp_hash,
 )
+from app.services.sms import (
+    BaseSMSProvider,
+    HttpSMSProvider,
+    MockSMSProvider,
+    get_sms_provider,
+    send_and_store_otp,
+)
 
 __all__ = [
     "hash_secret",
@@ -18,4 +25,9 @@ __all__ = [
     "check_send_limits",
     "save_otp_hash",
     "verify_otp_hash",
+    "BaseSMSProvider",
+    "MockSMSProvider",
+    "HttpSMSProvider",
+    "get_sms_provider",
+    "send_and_store_otp",
 ]
